@@ -1,0 +1,27 @@
+name: Weekly track-record grade
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Grade last 7 days of alerts
+        run: python grade.py
+        env:
+          WHOP_API_KEY: ${{ secrets.WHOP_API_KEY }}
+          WHOP_USER_ID: ${{ secrets.WHOP_USER_ID }}
+          WHOP_COMPANY_ID: ${{ secrets.WHOP_COMPANY_ID }}
+          WHOP_TRACK_EXP_ID: ${{ secrets.WHOP_TRACK_EXP_ID }}
+          GRADE_LOOKBACK_DAYS: "7"
