@@ -1,0 +1,43 @@
+name: Whale scanner
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_post:
+        description: "Send a test post to Whop (verifies wiring)"
+        type: boolean
+        default: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run scanner
+        run: python scanner.py ${{ inputs.test_post && '--test-post' || '' }}
+        env:
+          WHOP_API_KEY: ${{ secrets.WHOP_API_KEY }}
+          WHOP_USER_ID: ${{ secrets.WHOP_USER_ID }}
+          WHOP_COMPANY_ID: ${{ secrets.WHOP_COMPANY_ID }}
+          WHOP_ALERTS_EXP_ID: ${{ secrets.WHOP_ALERTS_EXP_ID }}
+          WHOP_TRACK_EXP_ID: ${{ secrets.WHOP_TRACK_EXP_ID }}
+          POLY_WHALE_FLOOR_USD: "5000"
+          POLY_MEGA_FLOOR_USD: "10000"
+          KALSHI_WHALE_FLOOR_USD: "5000"
+
+      - name: Persist bot state
+        run: |
+          git config user.name "whale-bot"
+          git config user.email "whale-bot@localhost"
+          git add state.json alerts_log.jsonl 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "bot state $(date -u +%FT%TZ)" || true
+          git push || true
