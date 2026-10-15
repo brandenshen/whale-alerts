@@ -25,7 +25,7 @@ TRACK_EXP_ID    = os.environ.get("WHOP_TRACK_EXP_ID")
 LOG_PATH        = os.environ.get("ALERTS_LOG_PATH", "alerts_log.jsonl")
 DAYS            = int(os.environ.get("GRADE_LOOKBACK_DAYS", "7"))
 
-WHOP_GQL   = "https://api.whop.com/public-graphql"
+WHOP_REST_POST = "https://api.whop.com/api/v1/forum_posts"
 CLOB_BOOK  = "https://clob.polymarket.com/book"
 KALSHI     = "https://external-api.kalshi.com/trade-api/v2"
 UA = {"User-Agent": "whale-alert-bot/1.0 (+github-actions)"}
@@ -65,21 +65,23 @@ def drift_cents(a, now_px):
 
 
 def whop_post(title, content):
+    """Post via Whop REST API v1 (public GraphQL is closed to new integrations).
+    Needs an App API key with the forum:post:create scope."""
     if not TRACK_EXP_ID:
         log("WHOP_TRACK_EXP_ID not set - printing summary instead.")
         print(title, "\n", content)
         return
-    mutation = """mutation CreateForumPost($input: CreateForumPostInput!) {
-      createForumPost(input: $input) { id } }"""
-    h = {"Authorization": f"Bearer {WHOP_API_KEY}", "Content-Type": "application/json"}
-    if WHOP_USER_ID:
-        h["x-on-behalf-of"] = WHOP_USER_ID
-    if WHOP_COMPANY_ID:
-        h["x-company-id"] = WHOP_COMPANY_ID
-    r = requests.post(WHOP_GQL, headers=h, json={
-        "query": mutation,
-        "variables": {"input": {"forumExperienceId": TRACK_EXP_ID,
-                                "title": title, "content": content}}}, timeout=25)
+    try:
+        r = requests.post(
+            "https://api.whop.com/api/v1/forum_posts",
+            headers={"Authorization": f"Bearer {WHOP_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"experience_id": TRACK_EXP_ID, "title": title,
+                  "content": content},
+            timeout=25)
+    except Exception as e:
+        log("Track-record post request failed:", e)
+        return
     log("Track-record post status:", r.status_code, r.text[:200])
 
 
