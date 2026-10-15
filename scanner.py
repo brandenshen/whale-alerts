@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Whale + mispricing alert scanner -> Whop forums.
-$0 stack: Polymarket + Kalshi public APIs (no keys), GitHub Actions cron, Whop GraphQL.
+$0 stack: Polymarket + Kalshi public APIs (no keys), GitHub Actions cron, Whop REST API.
 
 Runs every 10 minutes:
   1. Pulls recent whale trades from Polymarket (primary) and Kalshi (best-effort).
   2. Detects: mega prints, whale clusters, new-whale wallets, momentum, cross-venue mispricing.
-  3. Posts alerts to your Whop forum via the Whop GraphQL API.
+  3. Posts alerts to your Whop forum via Whop's REST API (App API key).
   4. Logs every alert to alerts_log.jsonl for the weekly track-record grader.
 
 Usage:
@@ -36,9 +36,9 @@ def env(name, default=None, cast=str):
         return default
 
 
-WHOP_API_KEY    = env("WHOP_API_KEY")
-WHOP_USER_ID    = env("WHOP_USER_ID")            # auto-discovered via viewer query if empty
-WHOP_COMPANY_ID = env("WHOP_COMPANY_ID")         # optional
+WHOP_API_KEY    = env("WHOP_API_KEY")          # App API key with forum:post:create scope
+WHOP_USER_ID    = env("WHOP_USER_ID")            # legacy, no longer needed
+WHOP_COMPANY_ID = env("WHOP_COMPANY_ID")         # optional, unused
 ALERTS_EXP_ID   = env("WHOP_ALERTS_EXP_ID")      # forum experience id, exp_...
 TRACK_EXP_ID    = env("WHOP_TRACK_EXP_ID")       # optional second forum for track record
 
@@ -57,7 +57,6 @@ MAP_PATH   = env("MARKETS_MAP_PATH", "markets_map.json")
 LOG_PATH   = env("ALERTS_LOG_PATH", "alerts_log.jsonl")
 DRY_RUN    = env("DRY_RUN", "0") == "1"
 
-WHOP_GQL     = "https://api.whop.com/public-graphql"
 POLY_TRADES  = "https://data-api.polymarket.com/v2/trades"
 POLY_GAMMA   = "https://gamma-api.polymarket.com/markets"
 KALSHI_HOSTS = ["https://external-api.kalshi.com", "https://api.elections.kalshi.com"]
@@ -145,7 +144,7 @@ def fetch_poly_trades(since_ts):
                 "market": t.get("title", "?"),
                 "market_key": t.get("slug") or t.get("condition_id"),
                 "outcome": t.get("outcome", "?"),
-                "side": t.get("side", "?"),            # BUY / SELL
+                "side": t.get("side", "?"),
                 "usd": round(usd, 2),
                 "price": float(t.get("price", 0)),
                 "ts": ts,
@@ -343,41 +342,13 @@ def format_alert(kind, t, note):
 
 
 # ---------------------------------------------------------------- whop -----
+# Posting uses Whop's REST API v1 (the public GraphQL API is closed to new
+# integrations as of Oct 2026).
+#   POST https://api.whop.com/api/v1/forum_posts   {experience_id, title, content}
+# Auth: App API key (Bearer) with the forum:post:create scope.
+# Posts as the app's bot user; the app scope satisfies admin-only forums.
 
-def whop_headers():
-    h = {"Authorization": f"Bearer {WHOP_API_KEY}",
-         "Content-Type": "application/json"}
-    if WHOP_USER_ID:
-        h["x-on-behalf-of"] = WHOP_USER_ID
-    if WHOP_COMPANY_ID:
-        h["x-company-id"] = WHOP_COMPANY_ID
-    return h
-
-
-def whop_api(query, variables):
-    import requests
-    r = requests.post(WHOP_GQL, headers=whop_headers(),
-                      json={"query": query, "variables": variables}, timeout=25)
-    try:
-        return r.status_code, r.json()
-    except Exception:
-        return r.status_code, {"raw": r.text[:500]}
-
-
-def ensure_user_id():
-    """Discover our own user id via the viewer query if WHOP_USER_ID is unset."""
-    global WHOP_USER_ID
-    if WHOP_USER_ID:
-        return True
-    code, data = whop_api("query { viewer { user { id username } } }", {})
-    try:
-        u = data["data"]["viewer"]["user"]
-        WHOP_USER_ID = u["id"]
-        log(f"Posting as Whop user: {u.get('username')} ({WHOP_USER_ID})")
-        return True
-    except Exception:
-        log("Could not discover Whop user id:", code, str(data)[:300])
-        return False
+WHOP_REST_POST = "https://api.whop.com/api/v1/forum_posts"
 
 
 def whop_post(title, content, exp_id=None):
@@ -385,16 +356,26 @@ def whop_post(title, content, exp_id=None):
     if not exp_id:
         log("No forum experience id configured - skipping post.")
         return False
-    mutation = """mutation CreateForumPost($input: CreateForumPostInput!) {
-      createForumPost(input: $input) { id }
-    }"""
-    variables = {"input": {"forumExperienceId": exp_id,
-                           "title": title, "content": content}}
-    code, data = whop_api(mutation, variables)
-    if code == 200 and data.get("data", {}).get("createForumPost"):
-        log("Posted to Whop:", title[:60])
+    try:
+        import requests
+        r = requests.post(
+            WHOP_REST_POST,
+            headers={"Authorization": f"Bearer {WHOP_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"experience_id": exp_id, "title": title, "content": content},
+            timeout=25,
+        )
+    except Exception as e:
+        log("Whop post request failed:", e)
+        return False
+    if r.status_code in (200, 201):
+        try:
+            pid = r.json().get("id", "?")
+        except Exception:
+            pid = "?"
+        log(f"Posted to Whop ({pid}):", title[:60])
         return True
-    log("Whop post FAILED:", code, json.dumps(data)[:500])
+    log("Whop post FAILED:", r.status_code, r.text[:500])
     return False
 
 
@@ -427,9 +408,8 @@ def main():
     if not WHOP_API_KEY:
         log("FATAL: WHOP_API_KEY not set.")
         sys.exit(1)
-    if not ensure_user_id():
-        log("FATAL: set WHOP_USER_ID env var (see README).")
-        sys.exit(1)
+    # Note: with an App API key the bot posts as the app's bot user;
+    # no user-ID discovery needed.
 
     if args.test_post:
         ok = whop_post("✅ Bot connected",
