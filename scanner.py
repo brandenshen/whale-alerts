@@ -42,15 +42,19 @@ WHOP_COMPANY_ID = env("WHOP_COMPANY_ID")         # optional, unused
 ALERTS_EXP_ID   = env("WHOP_ALERTS_EXP_ID")      # forum experience id, exp_...
 TRACK_EXP_ID    = env("WHOP_TRACK_EXP_ID")       # optional second forum for track record
 
-POLY_FLOOR      = env("POLY_WHALE_FLOOR_USD", 25000, float)   # cluster / new-whale detection floor
-POLY_WHALE      = env("POLY_WHALE_TIER_USD", 100000, float)    # single-print "whale" tier
-POLY_MEGA       = env("POLY_MEGA_FLOOR_USD", 250000, float)    # single-print "mega" tier
-COOLDOWN_MIN    = env("MARKET_COOLDOWN_MIN", 360, int)        # per-market alert cooldown (6h)
+# Detection thresholds, recalibrated Oct 2026 against the record week ending
+# 2026-10-11 (1,025 prints >=$25k; old tiers would have fired ~79 tiered
+# alerts/day -> spam). New tiers target ~10 tiered alerts/day at peak volume.
+# Momentum left unchanged: public price-history for that week isn't retrievable.
+POLY_FLOOR      = env("POLY_WHALE_FLOOR_USD", 25000, float)   # feed filter + cluster / new-whale floor
+POLY_WHALE      = env("POLY_WHALE_TIER_USD", 100000, float)   # single-print "whale" tier (was 25k)
+POLY_MEGA       = env("POLY_MEGA_FLOOR_USD", 250000, float)    # single-print "mega" tier (was 50k)
+COOLDOWN_MIN    = env("MARKET_COOLDOWN_MIN", 360, int)         # per-market alert cooldown (6h)
 COMBO_FLOW_FLOOR = env("COMBO_FLOW_FLOOR_USD", 25000, float)   # min new volume between runs to alert
 KALSHI_FLOOR    = env("KALSHI_WHALE_FLOOR_USD", 5000, float)
 CLUSTER_MIN     = env("CLUSTER_WINDOW_MIN", 20, int)
 CLUSTER_N       = env("CLUSTER_COUNT", 3, int)
-CLUSTER_FLOOR   = env("CLUSTER_FLOOR_USD", 25000, float)
+CLUSTER_FLOOR   = env("CLUSTER_FLOOR_USD", 25000, float)       # was 5k (161 cluster alerts/day at peak)
 MOM_PCT         = env("MOMENTUM_PCT", 4.0, float)
 MOM_MIN         = env("MOMENTUM_WINDOW_MIN", 60, int)
 MISPRICING_C    = env("MISPRICING_MIN_CENTS", 4.0, float)
@@ -284,13 +288,40 @@ def detect(trades, state):
     for t in fresh:
         state["seen_ids"].append(t["id"])
 
-    # 1) tiered single prints: WHALE ($25k+) and MEGA ($50k+), with per-market cooldown.
-    #    One alert per market per COOLDOWN_MIN, unless the new print is >= 2x the
-    #    previously posted size (a much bigger follow-up still posts).
+    # 1) confluence tags first — the quality gate below reads these.
+    # new whale wallets (Polymarket only - Kalshi feed has no wallet field)
+    for t in fresh:
+        w = t.get("wallet")
+        if w and w not in state["seen_wallets"] and t["usd"] >= POLY_FLOOR:
+            state["seen_wallets"].append(w)
+            t["new_whale"] = True
+
+    # momentum: compare vs price remembered from >= MOM_MIN ago.
+    # Baseline refreshes only after a comparison, giving a true lookback window.
+    now = time.time()
+    for t in fresh:
+        k = f"{t['venue']}:{t['market_key']}:{t['outcome']}"
+        old = state["market_px"].get(k)
+        if old and now - old[0] >= MOM_MIN * 60 and old[1] > 0:
+            drift = (t["price"] - old[1]) / old[1] * 100
+            toward = (drift > 0 and t["side"] == "BUY") or (drift < 0 and t["side"] == "SELL")
+            if abs(drift) >= MOM_PCT and toward:
+                t["momentum"] = f"{drift:+.1f}% in {(now - old[0]) / 60:.0f}min"
+            state["market_px"][k] = [now, t["price"]]  # refresh baseline
+        elif not old:
+            state["market_px"][k] = [now, t["price"]]  # establish baseline
+
+    # 2) tiered single prints, with per-market cooldown.
+    #    MEGA always posts (rare + inherently significant). WHALE posts only
+    #    with confluence (new-whale wallet or momentum confirmation) — size
+    #    alone isn't signal. Cooldown: one alert per market per COOLDOWN_MIN,
+    #    unless the new print is >= 2x the previously posted size.
     for t in fresh:
         if t["usd"] >= POLY_MEGA:
             tier = "MEGA"
         elif t["usd"] >= POLY_WHALE:
+            if not (t.get("new_whale") or t.get("momentum")):
+                continue  # quality gate: no confluence, no post
             tier = "WHALE"
         else:
             continue
@@ -301,7 +332,7 @@ def detect(trades, state):
         state.setdefault("market_last_alert", {})[mk] = (t["ts"], t["usd"])
         alerts.append((tier, t, None))
 
-    # 2) clusters: N+ trades, same market+side, within window, each >= floor
+    # 3) clusters: N+ trades, same market+side, within window, each >= floor
     by_key = defaultdict(list)
     for t in fresh:
         if t["usd"] >= CLUSTER_FLOOR:
@@ -322,29 +353,7 @@ def detect(trades, state):
             else:
                 i += 1
 
-    # 3) new whale wallets (Polymarket only - Kalshi feed has no wallet field)
-    for t in fresh:
-        w = t.get("wallet")
-        if w and w not in state["seen_wallets"] and t["usd"] >= POLY_FLOOR:
-            state["seen_wallets"].append(w)
-            t["new_whale"] = True
-
-    # 4) momentum: compare vs price remembered from >= MOM_MIN ago.
-    # Baseline refreshes only after a comparison, giving a true lookback window.
-    now = time.time()
-    for t in fresh:
-        k = f"{t['venue']}:{t['market_key']}:{t['outcome']}"
-        old = state["market_px"].get(k)
-        if old and now - old[0] >= MOM_MIN * 60 and old[1] > 0:
-            drift = (t["price"] - old[1]) / old[1] * 100
-            toward = (drift > 0 and t["side"] == "BUY") or (drift < 0 and t["side"] == "SELL")
-            if abs(drift) >= MOM_PCT and toward:
-                t["momentum"] = f"{drift:+.1f}% in {(now - old[0]) / 60:.0f}min"
-            state["market_px"][k] = [now, t["price"]]  # refresh baseline
-        elif not old:
-            state["market_px"][k] = [now, t["price"]]  # establish baseline
-
-    # 5) cross-venue mispricing (best-effort, needs markets_map.json)
+    # 4) cross-venue mispricing (best-effort, needs markets_map.json)
     for m in load_map():
         try:
             k = _kalshi_get(f"/trade-api/v2/markets/{m['kalshi_ticker']}", None)
@@ -398,25 +407,25 @@ def format_alert(kind, t, note):
     head = {"MEGA": "\U0001F40B MEGA WHALE", "WHALE": "\U0001F40B WHALE PRINT",
             "CLUSTER": "\U0001F40B WHALE CLUSTER", "COMBO_FLOW": "\U0001F3AF COMBO FLOW",
             "MISPRICING": "\u2696\uFE0F MARKET DISAGREEMENT"}[kind]
-    lines = [f"{head} \u00B7 {venue}", "",
+    lines = [f"{head} · {venue}", "",
              f"{t['market']}"]
     if kind == "MISPRICING":
-        lines += [f"Kalshi {t['price']:.0%} vs Polymarket {t['poly_px']:.0%} \u2014 gap {t['diff_c']:.0f}\u00A2",
-                  "Check both books before acting \u2014 not arb."]
+        lines += [f"Kalshi {t['price']:.0%} vs Polymarket {t['poly_px']:.0%} — gap {t['diff_c']:.0f}¢",
+                  "Check both books before acting — not arb."]
     elif kind == "COMBO_FLOW":
         lines += [f"${t['usd']:,.0f} new volume since last scan",
-                  "Combo contracts price via RFQ \u2014 this is multi-leg flow, not a single print."]
+                  "Combo contracts price via RFQ — this is multi-leg flow, not a single print."]
     else:
         cents = int(round(t["price"] * 100))
         verb = "betting" if t["side"] == "BUY" else "selling"
-        lines.append(f"${t['usd']:,.0f} {verb} {str(t['outcome']).upper()} at {cents}\u00A2")
+        lines.append(f"${t['usd']:,.0f} {verb} {str(t['outcome']).upper()} at {cents}¢")
         if t.get("block"):
             lines.append("Block trade")
         if note:
             lines.append(f"\U0001F4CC {note}")
     tags = []
     if t.get("new_whale"):
-        tags.append("\U0001F194 New whale wallet")
+        tags.append("\U0001F193 New whale wallet")
     if t.get("momentum"):
         tags.append(f"\U0001F525 Momentum {t['momentum']}")
     if tags:
@@ -424,7 +433,6 @@ def format_alert(kind, t, note):
     link = trade_link(t)
     if link:
         lines += ["", f"Trade it here: {link}"]
-    lines += ["", "Not financial advice. 21+."]
     title = f"{head}: {t['market'][:70]}"
     return title, "\n".join(lines)
 
