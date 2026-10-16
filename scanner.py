@@ -5,7 +5,7 @@ $0 stack: Polymarket + Kalshi public APIs (no keys), GitHub Actions cron, Whop R
 
 Runs every 10 minutes:
   1. Pulls recent whale trades from Polymarket (primary) and Kalshi (best-effort).
-  2. Detects: mega prints, whale clusters, new-whale wallets, momentum, cross-venue mispricing.
+  2. Detects: tiered whale prints (whale/mega), whale clusters, new-whale wallets, momentum, cross-venue mispricing.
   3. Posts alerts to your Whop forum via Whop's REST API (App API key).
   4. Logs every alert to alerts_log.jsonl for the weekly track-record grader.
 
@@ -42,8 +42,10 @@ WHOP_COMPANY_ID = env("WHOP_COMPANY_ID")         # optional, unused
 ALERTS_EXP_ID   = env("WHOP_ALERTS_EXP_ID")      # forum experience id, exp_...
 TRACK_EXP_ID    = env("WHOP_TRACK_EXP_ID")       # optional second forum for track record
 
-POLY_FLOOR      = env("POLY_WHALE_FLOOR_USD", 5000, float)
-POLY_MEGA       = env("POLY_MEGA_FLOOR_USD", 10000, float)
+POLY_FLOOR      = env("POLY_WHALE_FLOOR_USD", 5000, float)   # cluster / new-whale detection floor
+POLY_WHALE      = env("POLY_WHALE_TIER_USD", 25000, float)    # single-print "whale" tier
+POLY_MEGA       = env("POLY_MEGA_FLOOR_USD", 50000, float)    # single-print "mega" tier
+COOLDOWN_MIN    = env("MARKET_COOLDOWN_MIN", 360, int)        # per-market alert cooldown (6h)
 KALSHI_FLOOR    = env("KALSHI_WHALE_FLOOR_USD", 5000, float)
 CLUSTER_MIN     = env("CLUSTER_WINDOW_MIN", 20, int)
 CLUSTER_N       = env("CLUSTER_COUNT", 3, int)
@@ -107,6 +109,7 @@ def load_state():
     s.setdefault("seen_ids", [])
     s.setdefault("seen_wallets", [])
     s.setdefault("market_px", {})   # market_key -> [ts, price]  (momentum memory)
+    s.setdefault("market_last_alert", {})  # "venue:market_key" -> [ts, usd] (cooldown)
     return s
 
 
@@ -116,6 +119,9 @@ def save_state(s):
     # prune old market prices (keep 3h)
     cutoff = time.time() - 3 * 3600
     s["market_px"] = {k: v for k, v in s["market_px"].items() if v[0] > cutoff}
+    # prune old per-market alert timestamps (keep 12h)
+    cutoff_m = time.time() - 12 * 3600
+    s["market_last_alert"] = {k: v for k, v in s.get("market_last_alert", {}).items() if v[0] > cutoff_m}
     with open(STATE_PATH, "w") as f:
         json.dump(s, f)
 
@@ -224,12 +230,22 @@ def detect(trades, state):
     for t in fresh:
         state["seen_ids"].append(t["id"])
 
-    # 1) mega prints
+    # 1) tiered single prints: WHALE ($25k+) and MEGA ($50k+), with per-market cooldown.
+    #    One alert per market per COOLDOWN_MIN, unless the new print is >= 2x the
+    #    previously posted size (a much bigger follow-up still posts).
     for t in fresh:
-        if t["usd"] >= POLY_MEGA and t["venue"] == "Polymarket":
-            alerts.append(("MEGA", t, None))
-        elif t["usd"] >= POLY_MEGA and t["venue"] == "Kalshi":
-            alerts.append(("MEGA", t, None))
+        if t["usd"] >= POLY_MEGA:
+            tier = "MEGA"
+        elif t["usd"] >= POLY_WHALE:
+            tier = "WHALE"
+        else:
+            continue
+        mk = f"{t['venue']}:{t['market_key']}"
+        last = state.get("market_last_alert", {}).get(mk)
+        if last and (t["ts"] - last[0]) < COOLDOWN_MIN * 60 and t["usd"] < 2 * last[1]:
+            continue
+        state.setdefault("market_last_alert", {})[mk] = (t["ts"], t["usd"])
+        alerts.append((tier, t, None))
 
     # 2) clusters: N+ trades, same market+side, within window, each >= floor
     by_key = defaultdict(list)
@@ -317,7 +333,8 @@ def fmt_usd(x):
 def format_alert(kind, t, note):
     ts = datetime.fromtimestamp(t["ts"], timezone.utc).strftime("%H:%M UTC")
     venue = t["venue"]
-    head = {"MEGA": "🐋 MEGA WHALE", "CLUSTER": "🐋 WHALE CLUSTER",
+    head = {"MEGA": "🐋 MEGA WHALE", "WHALE": "🐋 WHALE PRINT",
+            "CLUSTER": "🐋 WHALE CLUSTER",
             "MISPRICING": "⚖️ MARKET DISAGREEMENT"}[kind]
     lines = [f"{head} — {venue}", "",
              f"Market: {t['market']}",
@@ -396,7 +413,7 @@ def log_alert(kind, t, note):
         log("log write failed:", e)
 
 
-# ---------------------------------------------------------------- main -----
+# ---------------------------------------------------------------- main ---
 
 def main():
     ap = argparse.ArgumentParser()
