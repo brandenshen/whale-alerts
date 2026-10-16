@@ -1,8 +1,8 @@
-name: Weekly track-record grade
+name: Daily track-record grade
 
 on:
   schedule:
-    - cron: "0 9 * * 1"
+    - cron: "0 9 * * *"
   workflow_dispatch:
 
 jobs:
@@ -17,11 +17,11 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Grade last 7 days of alerts
+      - name: Grade last 24h of alerts
         run: python grade.py
         env:
           WHOP_API_KEY: ${{ secrets.WHOP_API_KEY }}
           WHOP_USER_ID: ${{ secrets.WHOP_USER_ID }}
           WHOP_COMPANY_ID: ${{ secrets.WHOP_COMPANY_ID }}
           WHOP_TRACK_EXP_ID: ${{ secrets.WHOP_TRACK_EXP_ID }}
-          GRADE_LOOKBACK_DAYS: "7"
+          GRADE_LOOKBACK_DAYS: "1"
