@@ -1,11 +1,8 @@
 name: Whale scanner
 
-permissions:
-  contents: write
-
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/10 * * * *"   # every 10 minutes (GitHub floor is 5)
   workflow_dispatch:
     inputs:
       test_post:
@@ -33,9 +30,11 @@ jobs:
           WHOP_COMPANY_ID: ${{ secrets.WHOP_COMPANY_ID }}
           WHOP_ALERTS_EXP_ID: ${{ secrets.WHOP_ALERTS_EXP_ID }}
           WHOP_TRACK_EXP_ID: ${{ secrets.WHOP_TRACK_EXP_ID }}
-          POLY_WHALE_FLOOR_USD: "5000"
-          POLY_WHALE_TIER_USD: "25000"
-          POLY_MEGA_FLOOR_USD: "50000"
+          POLY_WHALE_FLOOR_USD: "25000"
+          POLY_WHALE_TIER_USD: "100000"
+          POLY_MEGA_FLOOR_USD: "250000"
+          CLUSTER_FLOOR_USD: "25000"
+          COMBO_FLOW_FLOOR_USD: "25000"
           KALSHI_WHALE_FLOOR_USD: "5000"
 
       - name: Persist bot state
