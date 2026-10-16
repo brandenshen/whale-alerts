@@ -1,5 +1,8 @@
 name: Whale scanner
 
+permissions:
+  contents: write
+
 on:
   schedule:
     - cron: "*/10 * * * *"
@@ -31,7 +34,8 @@ jobs:
           WHOP_ALERTS_EXP_ID: ${{ secrets.WHOP_ALERTS_EXP_ID }}
           WHOP_TRACK_EXP_ID: ${{ secrets.WHOP_TRACK_EXP_ID }}
           POLY_WHALE_FLOOR_USD: "5000"
-          POLY_MEGA_FLOOR_USD: "10000"
+          POLY_WHALE_TIER_USD: "25000"
+          POLY_MEGA_FLOOR_USD: "50000"
           KALSHI_WHALE_FLOOR_USD: "5000"
 
       - name: Persist bot state
