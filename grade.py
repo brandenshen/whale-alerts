@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Weekly track-record grader. Reads alerts_log.jsonl, checks how each alert's
+Daily track-record grader. Reads alerts_log.jsonl, checks how each alert's
 market price moved after the alert, and posts a public summary to the
 Whop track-record forum.
 
@@ -8,7 +8,7 @@ Honest metric: price DRIFT toward/away from the signaled side, not win rate.
 A whale buying YES at 0.60 whose market sits at 0.72 a week later drifted +12c
 toward the signal. That's the number members can verify themselves.
 
-Runs weekly via .github/workflows/grade.yml (Mondays).
+Runs daily via .github/workflows/grade.yml (09:00 UTC).
 """
 
 import json
@@ -122,8 +122,8 @@ def main():
 
     n = len(drifts)
     avg = sum(drifts) / n if n else 0
-    week = datetime.now(timezone.utc).strftime("%b %d")
-    title = f"📊 Track record — week of {week}"
+    day = datetime.now(timezone.utc).strftime("%b %d")
+    title = f"📊 Track record — {day}"
     lines = [f"Alerts graded: {n}",
              f"Drifted toward signal: {wins} | against: {losses}",
              f"Average drift: {avg:+.1f}¢ per alert", ""]
