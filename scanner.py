@@ -42,27 +42,18 @@ WHOP_COMPANY_ID = env("WHOP_COMPANY_ID")         # optional, unused
 ALERTS_EXP_ID   = env("WHOP_ALERTS_EXP_ID")      # forum experience id, exp_...
 TRACK_EXP_ID    = env("WHOP_TRACK_EXP_ID")       # optional second forum for track record
 
-# Detection thresholds, recalibrated Oct 2026 against the record week ending
-# 2026-10-11 (1,025 prints >=$25k; old tiers would have fired ~79 tiered
-# alerts/day -> spam). New tiers target ~10 tiered alerts/day at peak volume.
-# Momentum left unchanged: public price-history for that week isn't retrievable.
-POLY_FLOOR      = env("POLY_WHALE_FLOOR_USD", 25000, float)   # feed filter + cluster / new-whale floor
-POLY_WHALE      = env("POLY_WHALE_TIER_USD", 100000, float)   # single-print "whale" tier (was 25k)
-POLY_MEGA       = env("POLY_MEGA_FLOOR_USD", 250000, float)    # single-print "mega" tier (was 50k)
-COOLDOWN_MIN    = env("MARKET_COOLDOWN_MIN", 360, int)         # per-market alert cooldown (6h)
+POLY_FLOOR      = env("POLY_WHALE_FLOOR_USD", 5000, float)   # cluster / new-whale detection floor
+POLY_WHALE      = env("POLY_WHALE_TIER_USD", 25000, float)    # single-print "whale" tier
+POLY_MEGA       = env("POLY_MEGA_FLOOR_USD", 50000, float)    # single-print "mega" tier
+COOLDOWN_MIN    = env("MARKET_COOLDOWN_MIN", 360, int)        # per-market alert cooldown (6h)
+COMBO_FLOW_FLOOR = env("COMBO_FLOW_FLOOR_USD", 25000, float)   # min new volume between runs to alert
 KALSHI_FLOOR    = env("KALSHI_WHALE_FLOOR_USD", 5000, float)
 CLUSTER_MIN     = env("CLUSTER_WINDOW_MIN", 20, int)
 CLUSTER_N       = env("CLUSTER_COUNT", 3, int)
-CLUSTER_FLOOR   = env("CLUSTER_FLOOR_USD", 25000, float)       # was 5k (161 cluster alerts/day at peak)
+CLUSTER_FLOOR   = env("CLUSTER_FLOOR_USD", 5000, float)
 MOM_PCT         = env("MOMENTUM_PCT", 4.0, float)
 MOM_MIN         = env("MOMENTUM_WINDOW_MIN", 60, int)
 MISPRICING_C    = env("MISPRICING_MIN_CENTS", 4.0, float)
-# Combo/parlay contracts (launched Aug 2026) don't appear in the public trades
-# feed (RFQ flow), so coverage tracks all-time volume deltas on combo
-# instruments via the Gamma API. Record-week combo volume was too thin to
-# calibrate ($20k total across all combo instruments), so the floor aligns
-# with the whale tier and the report states this plainly.
-COMBO_FLOW_FLOOR = env("COMBO_FLOW_FLOOR_USD", 25000, float)   # min new volume between runs to alert
 
 STATE_PATH = env("STATE_PATH", "state.json")
 MAP_PATH   = env("MARKETS_MAP_PATH", "markets_map.json")
@@ -393,33 +384,47 @@ def fmt_usd(x):
     return f"${x:,.0f}"
 
 
+def trade_link(t):
+    """Direct link so members can trade the market themselves."""
+    if t["venue"] == "Polymarket" and t.get("slug"):
+        return f"https://polymarket.com/event/{t['slug']}"
+    if t["venue"] == "Kalshi" and t.get("ticker"):
+        return f"https://kalshi.com/markets/{t['ticker']}"
+    return ""
+
+
 def format_alert(kind, t, note):
-    ts = datetime.fromtimestamp(t["ts"], timezone.utc).strftime("%H:%M UTC")
     venue = t["venue"]
-    head = {"MEGA": "🐋 MEGA WHALE", "WHALE": "🐋 WHALE PRINT",
-            "CLUSTER": "🐋 WHALE CLUSTER", "COMBO_FLOW": "🎯 COMBO FLOW",
-            "MISPRICING": "⚖️ MARKET DISAGREEMENT"}[kind]
-    lines = [f"{head} — {venue}", "",
-             f"Market: {t['market']}",
-             f"Side: {t['side']} {t['outcome']}" + ("" if kind == "COMBO_FLOW" else f" @ {t['price']:.2f}")]
-    if kind == "COMBO_FLOW":
-        lines.append(f"New volume since last scan: {fmt_usd(t['usd'])}")
-        lines.append("Combo/parlay contracts price via RFQ - size reflects multi-leg flow, not a single order-book print.")
+    head = {"MEGA": "\U0001F40B MEGA WHALE", "WHALE": "\U0001F40B WHALE PRINT",
+            "CLUSTER": "\U0001F40B WHALE CLUSTER", "COMBO_FLOW": "\U0001F3AF COMBO FLOW",
+            "MISPRICING": "\u2696\uFE0F MARKET DISAGREEMENT"}[kind]
+    lines = [f"{head} \u00B7 {venue}", "",
+             f"{t['market']}"]
     if kind == "MISPRICING":
-        lines += [f"Kalshi: {t['price']:.2f}  vs  Polymarket: {t['poly_px']:.2f}",
-                  f"Gap: {t['diff_c']}¢  (check both books before acting — not arb)"]
-    elif kind != "COMBO_FLOW":
-        lines.append(f"Size: {fmt_usd(t['usd'])}")
+        lines += [f"Kalshi {t['price']:.0%} vs Polymarket {t['poly_px']:.0%} \u2014 gap {t['diff_c']:.0f}\u00A2",
+                  "Check both books before acting \u2014 not arb."]
+    elif kind == "COMBO_FLOW":
+        lines += [f"${t['usd']:,.0f} new volume since last scan",
+                  "Combo contracts price via RFQ \u2014 this is multi-leg flow, not a single print."]
+    else:
+        cents = int(round(t["price"] * 100))
+        verb = "betting" if t["side"] == "BUY" else "selling"
+        lines.append(f"${t['usd']:,.0f} {verb} {str(t['outcome']).upper()} at {cents}\u00A2")
         if t.get("block"):
-            lines.append("Type: BLOCK TRADE")
-    if note:
-        lines.append(f"Note: {note}")
+            lines.append("Block trade")
+        if note:
+            lines.append(f"\U0001F4CC {note}")
+    tags = []
     if t.get("new_whale"):
-        lines.append("🆕 First-seen whale wallet")
+        tags.append("\U0001F194 New whale wallet")
     if t.get("momentum"):
-        lines.append(f"🔥 Momentum: {t['momentum']} toward this side")
-    lines += ["", f"Detected {ts}", "",
-              "Not financial advice. 21+. Trade responsibly."]
+        tags.append(f"\U0001F525 Momentum {t['momentum']}")
+    if tags:
+        lines += [""] + tags
+    link = trade_link(t)
+    if link:
+        lines += ["", f"Trade it here: {link}"]
+    lines += ["", "Not financial advice. 21+."]
     title = f"{head}: {t['market'][:70]}"
     return title, "\n".join(lines)
 
@@ -475,11 +480,11 @@ def log_alert(kind, t, note):
                 "token_id": t.get("token_id", ""), "ticker": t.get("ticker", ""),
                 "slug": t.get("slug", ""), "note": note or "",
             }) + "\n")
-    except Exception as e:
+    except Exception:
         log("log write failed:", e)
 
 
-# ---------------------------------------------------------------- main -----
+# ---------------------------------------------------------------- main ---
 
 def main():
     ap = argparse.ArgumentParser()
@@ -495,7 +500,7 @@ def main():
     # no user-ID discovery needed.
 
     if args.test_post:
-        ok = whop_post("✅ Bot connected",
+        ok = whop_post("\u2705 Bot connected",
                        "The whale-alert bot is wired up. Alerts will appear here automatically.\n\n"
                        "Not financial advice. 21+.")
         sys.exit(0 if ok else 1)
