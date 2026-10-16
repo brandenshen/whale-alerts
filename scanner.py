@@ -42,17 +42,27 @@ WHOP_COMPANY_ID = env("WHOP_COMPANY_ID")         # optional, unused
 ALERTS_EXP_ID   = env("WHOP_ALERTS_EXP_ID")      # forum experience id, exp_...
 TRACK_EXP_ID    = env("WHOP_TRACK_EXP_ID")       # optional second forum for track record
 
-POLY_FLOOR      = env("POLY_WHALE_FLOOR_USD", 5000, float)   # cluster / new-whale detection floor
-POLY_WHALE      = env("POLY_WHALE_TIER_USD", 25000, float)    # single-print "whale" tier
-POLY_MEGA       = env("POLY_MEGA_FLOOR_USD", 50000, float)    # single-print "mega" tier
-COOLDOWN_MIN    = env("MARKET_COOLDOWN_MIN", 360, int)        # per-market alert cooldown (6h)
+# Detection thresholds, recalibrated Oct 2026 against the record week ending
+# 2026-10-11 (1,025 prints >=$25k; old tiers would have fired ~79 tiered
+# alerts/day -> spam). New tiers target ~10 tiered alerts/day at peak volume.
+# Momentum left unchanged: public price-history for that week isn't retrievable.
+POLY_FLOOR      = env("POLY_WHALE_FLOOR_USD", 25000, float)   # feed filter + cluster / new-whale floor
+POLY_WHALE      = env("POLY_WHALE_TIER_USD", 100000, float)   # single-print "whale" tier (was 25k)
+POLY_MEGA       = env("POLY_MEGA_FLOOR_USD", 250000, float)    # single-print "mega" tier (was 50k)
+COOLDOWN_MIN    = env("MARKET_COOLDOWN_MIN", 360, int)         # per-market alert cooldown (6h)
 KALSHI_FLOOR    = env("KALSHI_WHALE_FLOOR_USD", 5000, float)
 CLUSTER_MIN     = env("CLUSTER_WINDOW_MIN", 20, int)
 CLUSTER_N       = env("CLUSTER_COUNT", 3, int)
-CLUSTER_FLOOR   = env("CLUSTER_FLOOR_USD", 5000, float)
+CLUSTER_FLOOR   = env("CLUSTER_FLOOR_USD", 25000, float)       # was 5k (161 cluster alerts/day at peak)
 MOM_PCT         = env("MOMENTUM_PCT", 4.0, float)
 MOM_MIN         = env("MOMENTUM_WINDOW_MIN", 60, int)
 MISPRICING_C    = env("MISPRICING_MIN_CENTS", 4.0, float)
+# Combo/parlay contracts (launched Aug 2026) don't appear in the public trades
+# feed (RFQ flow), so coverage tracks all-time volume deltas on combo
+# instruments via the Gamma API. Record-week combo volume was too thin to
+# calibrate ($20k total across all combo instruments), so the floor aligns
+# with the whale tier and the report states this plainly.
+COMBO_FLOW_FLOOR = env("COMBO_FLOW_FLOOR_USD", 25000, float)   # min new volume between runs to alert
 
 STATE_PATH = env("STATE_PATH", "state.json")
 MAP_PATH   = env("MARKETS_MAP_PATH", "markets_map.json")
@@ -221,6 +231,59 @@ def fetch_kalshi_trades(since_ts):
     return out
 
 
+def fetch_combo_flows(state):
+    """Combo/parlay contract coverage (contracts launched Aug 2026).
+
+    Combo trades never appear in the public v2/trades feed (they price via
+    RFQ/market-maker flow), so this tracks all-time volume (volumeNum) deltas
+    on combo instruments between runs via the Gamma API. First sighting of an
+    instrument only establishes the baseline - no alert.
+    Kalshi combos are invisible in Kalshi's public API, so this is
+    Polymarket-only; the report states that plainly.
+    """
+    flows = []
+    seen = {}
+    for q in ("combo", "parlay"):
+        s = http_get("https://gamma-api.polymarket.com/public-search",
+                     {"q": q, "limit": 50})
+        if not s:
+            continue
+        for e in s.get("events", []):
+            for mk in e.get("markets", []):
+                t = ((mk.get("question") or "") + " " + (mk.get("slug") or "")).lower()
+                if "combo" not in t and "parlay" not in t:
+                    continue
+                try:
+                    vol = float(mk.get("volumeNum") or 0)
+                except Exception:
+                    continue
+                mid = str(mk.get("id"))
+                seen[mid] = {"q": mk.get("question") or mid, "vol": vol}
+    prev = state.get("combo_vol", {})
+    now = int(time.time())
+    for mid, info in seen.items():
+        old = prev.get(mid)
+        if old is None:
+            continue  # baseline established, no alert on first sighting
+        delta = info["vol"] - old
+        if delta >= COMBO_FLOW_FLOOR:
+            flows.append({
+                "venue": "Polymarket",
+                "id": f"combo-{mid}-{now // 3600}",
+                "market": info["q"],
+                "market_key": f"combo:{mid}",
+                "outcome": "YES",
+                "side": "COMBO",
+                "usd": round(delta, 2),
+                "price": 0,
+                "ts": now,
+                "wallet": "",
+                "combo": True,
+            })
+    state["combo_vol"] = {mid: info["vol"] for mid, info in seen.items()}
+    return flows
+
+
 # ---------------------------------------------------------------- detect ---
 
 def detect(trades, state):
@@ -334,15 +397,18 @@ def format_alert(kind, t, note):
     ts = datetime.fromtimestamp(t["ts"], timezone.utc).strftime("%H:%M UTC")
     venue = t["venue"]
     head = {"MEGA": "🐋 MEGA WHALE", "WHALE": "🐋 WHALE PRINT",
-            "CLUSTER": "🐋 WHALE CLUSTER",
+            "CLUSTER": "🐋 WHALE CLUSTER", "COMBO_FLOW": "🎯 COMBO FLOW",
             "MISPRICING": "⚖️ MARKET DISAGREEMENT"}[kind]
     lines = [f"{head} — {venue}", "",
              f"Market: {t['market']}",
-             f"Side: {t['side']} {t['outcome']} @ {t['price']:.2f}"]
+             f"Side: {t['side']} {t['outcome']}" + ("" if kind == "COMBO_FLOW" else f" @ {t['price']:.2f}")]
+    if kind == "COMBO_FLOW":
+        lines.append(f"New volume since last scan: {fmt_usd(t['usd'])}")
+        lines.append("Combo/parlay contracts price via RFQ - size reflects multi-leg flow, not a single order-book print.")
     if kind == "MISPRICING":
         lines += [f"Kalshi: {t['price']:.2f}  vs  Polymarket: {t['poly_px']:.2f}",
                   f"Gap: {t['diff_c']}¢  (check both books before acting — not arb)"]
-    else:
+    elif kind != "COMBO_FLOW":
         lines.append(f"Size: {fmt_usd(t['usd'])}")
         if t.get("block"):
             lines.append("Type: BLOCK TRADE")
@@ -413,7 +479,7 @@ def log_alert(kind, t, note):
         log("log write failed:", e)
 
 
-# ---------------------------------------------------------------- main ---
+# ---------------------------------------------------------------- main -----
 
 def main():
     ap = argparse.ArgumentParser()
@@ -442,6 +508,27 @@ def main():
     log(f"Fetched {len(poly)} Polymarket + {len(kalshi)} Kalshi trades above floor.")
 
     alerts, fresh = detect(poly + kalshi, state)
+
+    # Combo/parlay contract coverage (volume-delta based; see fetch_combo_flows).
+    combo_alerts = fetch_combo_flows(state)
+    if dry and not combo_alerts and env("COMBO_TEST_FIXTURE", "1") == "1":
+        # Live combo flow is currently near zero, so the dry run proves the
+        # combo code path with a clearly-labeled synthetic fixture instead.
+        combo_alerts = [("COMBO_FLOW", {
+            "venue": "Polymarket",
+            "id": "combo-test-fixture",
+            "market": "[TEST] Russia x Ukraine Peace Combo",
+            "market_key": "combo:test",
+            "outcome": "YES",
+            "side": "COMBO",
+            "usd": 30000.0,
+            "price": 0,
+            "ts": int(time.time()),
+            "wallet": "",
+            "combo": True,
+        }, "TEST FIXTURE: simulated +$30,000 volume jump. Live combo volume is "
+            "currently near zero, so no real combo flow was detectable.")]
+    alerts.extend(combo_alerts)
 
     if poly:
         state["poly_last_ts"] = max(t["ts"] for t in poly)
